@@ -2,7 +2,13 @@
 //  SignalMonitor.swift
 //  OdinSignalCollector
 //
-//  Core signal monitoring service using native iOS APIs
+//  Core signal monitoring service using native iOS APIs.
+//
+//  Frameworks used:
+//    - CoreTelephony                     – radio access technology and carrier information
+//    - SystemConfiguration.CaptiveNetwork – Wi-Fi SSID
+//    - CoreLocation                       – GPS positioning
+//    - Network                            – network path / connection-type detection
 //
 
 import Foundation
@@ -10,139 +16,185 @@ import Combine
 import CoreTelephony
 import Network
 import CoreLocation
+import SystemConfiguration.CaptiveNetwork
 
 // MARK: - Signal Monitor Service
 
-/// Main service for monitoring cellular and network signals
+/// Main service for monitoring cellular and network signals.
+///
+/// Exposes real-time data sourced exclusively from public iOS frameworks,
+/// making the implementation suitable for App Store submission.
+///
+/// ## Permissions required
+/// - **Location** – "When In Use" authorization is requested automatically so
+///   that ``location`` can be populated and Wi-Fi SSID can be read.
+/// - **Access Wi-Fi Information** capability – must be enabled in the Xcode
+///   project's Signing & Capabilities pane for ``wifiSSID`` to return a real
+///   value.
 @MainActor
-class SignalMonitor: ObservableObject {
-    
+class SignalMonitor: NSObject, ObservableObject {
+
     // MARK: - Published Properties
-    
+
+    /// Most recently collected signal snapshot; `nil` before the first poll.
     @Published var currentSignalData: SignalData?
+
+    /// Overall network reachability, updated by `NWPathMonitor`.
     @Published var connectionStatus: ConnectionStatus = .unknown
+
+    /// Lifecycle state of the monitor (active / paused / stopped).
     @Published var monitoringState: MonitoringState = .stopped
+
+    /// `true` while the monitor is running (active or paused).
     @Published var isMonitoring: Bool = false
-    
+
+    /// Human-readable radio access technology, e.g. `"LTE"`, `"5G"`, `"3G"`.
+    /// Sourced from `CTTelephonyNetworkInfo.serviceCurrentRadioAccessTechnology`.
+    @Published var radioTech: String = "Unknown"
+
+    /// Carrier name from the primary SIM card.
+    /// Sourced from `CTCarrier.carrierName`; `"Unknown"` when unavailable.
+    @Published var carrierName: String = "Unknown"
+
+    /// SSID of the currently associated Wi-Fi network.
+    /// Sourced from `CNCopyCurrentNetworkInfo`; `"Unknown"` when unavailable
+    /// or when the required entitlement / location permission is absent.
+    @Published var wifiSSID: String = "Unknown"
+
+    /// Wi-Fi received signal strength in dBm.
+    /// iOS provides no public API to read Wi-Fi RSSI, so this is always `0`.
+    @Published var wifiRSSI: Int = 0
+
+    /// Most recent GPS fix from `CLLocationManager`; `nil` until the first
+    /// location update is received.
+    @Published var location: CLLocation?
+
     // MARK: - Private Properties
-    
+
     private var cancellables = Set<AnyCancellable>()
     private var monitoringTimer: Timer?
     private let networkInfo = CTTelephonyNetworkInfo()
     private let pathMonitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "com.odinsignalcollector.monitor")
     private var locationManager: CLLocationManager?
-    
-    private var updateInterval: TimeInterval = 5.0 // Update every 5 seconds
-    
+
+    /// Polling interval in seconds (default 5 s, minimum 1 s).
+    private var updateInterval: TimeInterval = 5.0
+
     // MARK: - Initialization
-    
-    init() {
+
+    override init() {
+        super.init()
+        setupLocationManager()
         setupNetworkMonitoring()
     }
-    
+
     deinit {
-        stopMonitoring()
+        monitoringTimer?.invalidate()
+        pathMonitor.cancel()
+        locationManager?.stopUpdatingLocation()
     }
-    
+
     // MARK: - Public Methods
-    
-    /// Start monitoring signals
+
+    /// Start monitoring signals.
     func startMonitoring() {
         guard !isMonitoring else { return }
-        
+
         isMonitoring = true
         monitoringState = .active
-        
-        // Start network path monitoring
+
         pathMonitor.start(queue: monitorQueue)
-        
-        // Start periodic signal updates
         startPeriodicUpdates()
-        
-        // Request initial signal data
+
         Task {
             await updateSignalData()
         }
-        
+
         print("✓ Signal monitoring started")
     }
-    
-    /// Stop monitoring signals
+
+    /// Stop monitoring signals.
     func stopMonitoring() {
         guard isMonitoring else { return }
-        
+
         isMonitoring = false
         monitoringState = .stopped
-        
-        // Stop network monitoring
+
         pathMonitor.cancel()
-        
-        // Stop periodic updates
         stopPeriodicUpdates()
-        
+
         print("✓ Signal monitoring stopped")
     }
-    
-    /// Pause monitoring
+
+    /// Pause monitoring without fully stopping it.
     func pauseMonitoring() {
         guard isMonitoring else { return }
-        
+
         monitoringState = .paused
         stopPeriodicUpdates()
-        
+
         print("⏸ Signal monitoring paused")
     }
-    
-    /// Resume monitoring
+
+    /// Resume a previously paused monitor.
     func resumeMonitoring() {
         guard monitoringState == .paused else { return }
-        
+
         monitoringState = .active
         startPeriodicUpdates()
-        
+
         print("▶ Signal monitoring resumed")
     }
-    
-    /// Update monitoring interval
+
+    /// Change the polling interval (minimum 1 second).
     func setUpdateInterval(_ interval: TimeInterval) {
-        updateInterval = max(1.0, interval) // Minimum 1 second
-        
+        updateInterval = max(1.0, interval)
+
         if isMonitoring && monitoringState == .active {
             stopPeriodicUpdates()
             startPeriodicUpdates()
         }
     }
-    
-    /// Force immediate signal update
+
+    /// Trigger an immediate signal-data refresh.
     func refreshSignalData() async {
         await updateSignalData()
     }
-    
-    // MARK: - Private Methods
-    
+
+    // MARK: - Private Setup
+
+    /// Configures `CLLocationManager`, requests when-in-use authorization, and
+    /// starts updating once permission is granted (handled in the delegate).
+    private func setupLocationManager() {
+        let manager = CLLocationManager()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+        manager.distanceFilter = 10
+        locationManager = manager
+        manager.requestWhenInUseAuthorization()
+    }
+
+    /// Configures `NWPathMonitor` to keep ``connectionStatus`` current and
+    /// trigger a signal-data refresh whenever the path changes.
     private func setupNetworkMonitoring() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                
-                if path.status == .satisfied {
-                    self.connectionStatus = .connected
-                } else {
-                    self.connectionStatus = .disconnected
-                }
-                
+
+                self.connectionStatus = path.status == .satisfied ? .connected : .disconnected
+
                 if self.isMonitoring && self.monitoringState == .active {
                     await self.updateSignalData()
                 }
             }
         }
     }
-    
+
     private func startPeriodicUpdates() {
         monitoringTimer = Timer.scheduledTimer(withTimeInterval: updateInterval, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            
+
             Task { @MainActor in
                 if self.monitoringState == .active {
                     await self.updateSignalData()
@@ -150,53 +202,82 @@ class SignalMonitor: ObservableObject {
             }
         }
     }
-    
+
     private func stopPeriodicUpdates() {
         monitoringTimer?.invalidate()
         monitoringTimer = nil
     }
-    
+
     private func updateSignalData() async {
-        let signalData = await collectSignalData()
+        let signalData = collectSignalData()
         self.currentSignalData = signalData
     }
-    
-    private func collectSignalData() async -> SignalData {
-        // Collect cellular information
-        let carrier = networkInfo.serviceSubscriberCellularProviders?.first?.value
-        let carrierName = carrier?.carrierName
-        
-        // Get current radio access technology
-        let radioTech = networkInfo.serviceCurrentRadioAccessTechnology?.first?.value
-        let technology = mapRadioTechnology(radioTech)
-        
-        // Simulate signal strength (iOS doesn't provide direct API for signal strength in dBm)
-        // In a real app, this would require private APIs or carrier-specific implementations
-        let signalStrength = simulateSignalStrength()
-        
-        // Get connection type
-        let connectionType = determineConnectionType()
-        
-        // Get location if available
-        let location = getLastKnownLocation()
-        
+
+    // MARK: - Data Collection
+
+    /// Collects a ``SignalData`` snapshot from real iOS APIs and updates all
+    /// relevant `@Published` properties as a side-effect.
+    private func collectSignalData() -> SignalData {
+        // Capture location once; both this method and the delegate callback
+        // run on @MainActor, so no race is possible, but capturing up-front
+        // makes the intent explicit.
+        let currentLocation = self.location
+
+        let (name, tech) = readCellularInfo()
+        let ssid = readWiFiSSID()
+
+        self.carrierName = name
+        self.radioTech   = tech
+        self.wifiSSID    = ssid
+        // wifiRSSI stays 0 — no public iOS API exposes Wi-Fi RSSI.
+
         return SignalData(
-            signalStrength: signalStrength,
-            technology: technology,
-            carrierName: carrierName,
-            connectionType: connectionType,
-            latitude: location?.latitude,
-            longitude: location?.longitude
+            signalStrength: nil,   // No public API for cellular signal strength in dBm.
+            technology: tech,
+            carrierName: name == "Unknown" ? nil : name,
+            connectionType: determineConnectionType(),
+            latitude: currentLocation?.coordinate.latitude,
+            longitude: currentLocation?.coordinate.longitude
         )
     }
-    
+
+    /// Returns `(carrierName, radioTech)` sourced from `CTTelephonyNetworkInfo`.
+    ///
+    /// MCC, MNC, and ISO country code are read from `CTCarrier` and emitted
+    /// to the console for diagnostics but are not exposed as published properties.
+    private func readCellularInfo() -> (carrierName: String, radioTech: String) {
+        let provider = networkInfo.serviceSubscriberCellularProviders?.values.first
+        let name     = provider?.carrierName       ?? "Unknown"
+        let mcc      = provider?.mobileCountryCode ?? ""
+        let mnc      = provider?.mobileNetworkCode ?? ""
+        let iso      = provider?.isoCountryCode    ?? ""
+
+        if !mcc.isEmpty {
+            print("ℹ Carrier – name: \(name), MCC: \(mcc), MNC: \(mnc), ISO: \(iso)")
+        }
+
+        let techConstant = networkInfo.serviceCurrentRadioAccessTechnology?.values.first
+        let tech = mapRadioTechnology(techConstant)
+
+        return (name, tech)
+    }
+
+    /// Maps a `CTRadioAccessTechnology` constant string to a human-readable label.
+    ///
+    /// `CTRadioAccessTechnologyNR` and `CTRadioAccessTechnologyNRNSA` are
+    /// `@available(iOS 14.1, *)` API symbols (not plain string literals), so the
+    /// `#available` guard is required to keep the code compilable on earlier
+    /// deployment targets.
     private func mapRadioTechnology(_ tech: String?) -> String {
         guard let tech = tech else { return NetworkTechnology.unknown.rawValue }
-        
+
+        if #available(iOS 14.1, *) {
+            if tech == CTRadioAccessTechnologyNR || tech == CTRadioAccessTechnologyNRNSA {
+                return NetworkTechnology.fiveG.rawValue
+            }
+        }
+
         switch tech {
-        case CTRadioAccessTechnologyNRNSA,
-             CTRadioAccessTechnologyNR:
-            return NetworkTechnology.fiveG.rawValue
         case CTRadioAccessTechnologyLTE:
             return NetworkTechnology.lte.rawValue
         case CTRadioAccessTechnologyWCDMA,
@@ -210,11 +291,29 @@ class SignalMonitor: ObservableObject {
             return NetworkTechnology.unknown.rawValue
         }
     }
-    
+
+    /// Reads the current Wi-Fi SSID via the `CaptiveNetwork` API.
+    ///
+    /// Returns `"Unknown"` when:
+    /// - The device is not connected to Wi-Fi.
+    /// - The "Access Wi-Fi Information" capability is missing.
+    /// - Location authorization has not been granted.
+    private func readWiFiSSID() -> String {
+        guard let interfaces = CNCopySupportedInterfaces() as? [String] else {
+            return "Unknown"
+        }
+        for interface in interfaces {
+            if let info = CNCopyCurrentNetworkInfo(interface as CFString) as? [String: AnyObject],
+               let ssid = info[kCNNetworkInfoKeySSID as String] as? String {
+                return ssid
+            }
+        }
+        return "Unknown"
+    }
+
     private func determineConnectionType() -> String {
-        // Check if connected and what type
         let path = pathMonitor.currentPath
-        
+
         if path.usesInterfaceType(.wifi) {
             return NetworkTechnology.wifi.rawValue
         } else if path.usesInterfaceType(.cellular) {
@@ -225,32 +324,44 @@ class SignalMonitor: ObservableObject {
             return "Unknown"
         }
     }
-    
-    private func simulateSignalStrength() -> Int? {
-        // Since iOS doesn't provide public API for signal strength,
-        // we simulate it based on connection quality
-        // In a production app, you might use:
-        // - Private APIs (not allowed in App Store)
-        // - Carrier-specific SDKs
-        // - Network performance measurements as proxy
-        
-        guard connectionStatus == .connected else { return nil }
-        
-        // Simulate realistic signal strength values
-        let baseStrength = Int.random(in: -120...(-50))
-        return baseStrength
-    }
-    
-    private func getLastKnownLocation() -> (latitude: Double, longitude: Double)? {
-        // Placeholder for location data
-        // In a real app, you would integrate CLLocationManager
-        return nil
-    }
 }
 
-// MARK: - Constants
+// MARK: - CLLocationManagerDelegate
 
-extension CTRadioAccessTechnology {
-    static let CTRadioAccessTechnologyNRNSA = "CTRadioAccessTechnologyNRNSA"
-    static let CTRadioAccessTechnologyNR = "CTRadioAccessTechnologyNR"
+extension SignalMonitor: CLLocationManagerDelegate {
+
+    /// Responds to authorization changes by starting or stopping location updates.
+    ///
+    /// This is the recommended pattern from Apple's documentation: call
+    /// `requestWhenInUseAuthorization()` in setup and let this callback start
+    /// actual updates. The delegate is also invoked immediately when the app
+    /// launches if authorization is already granted, ensuring updates start
+    /// without any extra logic in `setupLocationManager`. Calling
+    /// `startUpdatingLocation()` while updates are already running is a no-op.
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            Task { @MainActor [weak self] in
+                self?.locationManager?.startUpdatingLocation()
+            }
+        case .denied, .restricted:
+            print("ℹ Location access denied or restricted – GPS and Wi-Fi SSID unavailable")
+        case .notDetermined:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    /// Stores the latest GPS fix as ``location``.
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let newLocation = locations.last else { return }
+        Task { @MainActor [weak self] in
+            self?.location = newLocation
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("✗ Location update failed: \(error.localizedDescription)")
+    }
 }
